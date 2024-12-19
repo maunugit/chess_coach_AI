@@ -2,6 +2,7 @@ from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
+import chess
 import subprocess
 import os
 import sys
@@ -72,23 +73,20 @@ class ChessAnalyzer:
             print(f"Error in initialize_engine: {str(e)}")
             self.cleanup()
             return False
+        
     def analyze_position_deeply(self, fen: str, depth: int = 20) -> dict:
         """Provides a deeper analysis of a position including best continuation"""
         if not self.process or self.process.poll() is not None:
             if not self.initialize_engine():
-                return {
-                    "evaluation": 0.0,
-                    "best_move": "",
-                    "best_line": [],
-                    "is_mate": False,
-                    "mate_in": None,
-                    "comment": ""
-                }
-
+                return self._get_default_response()
         try:
             print(f"Analyzing position deeply: {fen}")
             self._send_command("ucinewgame")
+            # First analyze normal depth
             self._send_command(f"position fen {fen}")
+            # Tell Stockfish to report scores from White's perspective
+            self._send_command("setoption name UCI_Chess960 value false")
+            self._send_command("setoption name UCI_AnalyseMode value true")
             self._send_command(f"go depth {depth}")
 
             best_move = None
@@ -96,16 +94,46 @@ class ChessAnalyzer:
             is_mate = False
             mate_in = None
             best_line = []
+
+            # Store previous position's evaluation for comparison
+            prev_evaluation = self._get_previous_evaluation(fen)
+            is_likely_trade = False
             
             while True:
                 line = self.process.stdout.readline().strip()
                 print(f"Engine output: {line}")
 
                 if "score cp " in line:
-                    score = int(line.split("score cp ")[1].split()[0]) / 100
+                    score_parts = line.split("score cp ")[1].split()
+                    score = int(score_parts[0]) / 100
+
+                    # A check to see if this works
+                    if len(score_parts) >  1 and "upperbound" not in score_parts and "lowerbound" not in score_parts:
+                        if any("wtime" in part or "btime" in part for part in score_parts):
+                            raw_score = -score
+
+                    # Detect potential trades in position evaluation
+                    if prev_evaluation is not None:
+                        score_change = abs(raw_score - prev_evaluation)
+                        if score_change > 2.5: # This is a significant change in eval
+                            is_likely_trade = self._detect_trade(fen, best_line)
+                            if is_likely_trade:
+                                # Return the eval to normal because it's a trade
+                                score = self._smooth_trade_evaluation(raw_score, prev_evaluation)
+                            else:
+                                score = raw_score
+                        else:
+                            score = raw_score
+                    else:
+                        score = raw_score
+
                 elif "score mate " in line:
                     is_mate = True
-                    mate_in = int(line.split("score mate ")[1].split()[0])
+                    mate_parts = line.split("score mate ")[1].split()
+                    mate_in = int(mate_parts[0])
+                    # If it's black to move, negate mate score
+                    if len(mate_parts) > 1 and any("wtime" in part or "btime" in part for part in mate_parts):
+                        mate_in = -mate_in
                 
                 if "pv " in line:
                     best_line = line.split("pv ")[1].split()
@@ -117,8 +145,10 @@ class ChessAnalyzer:
                         best_move = line.split()[1]
                     break
 
-            # Generate human-readable commentary
-            comment = self._generate_commentary(score, is_mate, mate_in, best_line)
+            # Store current eval for next comparison
+            self._store_evaluation(fen, score)
+
+            comment = self._generate_commentary(score, is_mate, mate_in, best_line, is_likely_trade)
 
             return {
                 "evaluation": score,
@@ -126,29 +156,66 @@ class ChessAnalyzer:
                 "best_line": best_line[:5],  # First 5 moves of the best line
                 "is_mate": is_mate,
                 "mate_in": mate_in,
-                "comment": comment
+                "comment": comment,
+                "is_trade": is_likely_trade
             }
 
         except Exception as e:
             print(f"Analysis error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+        
+    def _detect_trade(self, fen: str, best_line: List[str]) -> bool:
+        """Detect if the position is likely in the middle of a trading sequence"""
+        if not best_line:
+            return False
+        
+        # Look at the first few moves in the best line
+        # If they include captures that restore material balance, it's probably just a trade
+        try:
+            board = chess.Board(fen)
+            first_move = chess.Move.from_uci(best_line[0])
 
-    def _generate_commentary(self, score, is_mate, mate_in, best_line):
+            # Check if the best move is to capture
+            if board.is_capture(first_move):
+                # Look at next move (if there is one)
+                if len(best_line) > 1:
+                    board.push(first_move)
+                    second_move = chess.Move.from_uci(best_line[1])
+                    if board.is_capture(second_move):
+                        return True
+            return False
+        except:
+            return False
+        
+    def _smooth_trade_evaluation(self, current_eval: float, prev_eval: float) -> float:
+        """Smooth out evaluation during trading sequences"""
+        # If the  eval change is too dramatic and we detected a trade happening,
+        # return a weighted average favoring the previous eval
+        if abs(current_eval - prev_eval) > 2.5:
+            return (prev_eval * 0.7) + (current_eval * 0.3)
+        return current_eval
+
+    def _generate_commentary(self, score, is_mate, mate_in, best_line, is_trade=False):
         """Generate human-readable commentary based on the position analysis"""
         if is_mate:
             if mate_in > 0:
-                return f"There's a forced mate in {mate_in} moves."
+                return f"{'White' if mate_in > 0 else 'Black'} has a forced mate in {abs(mate_in)} moves."
             else:
-                return f"The position is losing with mate in {abs(mate_in)} moves."
+                return f"{'Black' if mate_in > 0 else 'White'} has a forced mate in {abs(mate_in)} moves."
+        
+        if is_trade:
+            base_comment = "Position is in the middle of a trading sequence. "
+        else:
+            base_comment = ""
         
         if abs(score) < 0.5:
-            return "The position is approximately equal."
+            return base_comment + "The position is approximately equal."
         elif abs(score) < 1.5:
-            return f"{'White' if score > 0 else 'Black'} has a slight advantage."
+            return base_comment + f"{'White' if score > 0 else 'Black'} has a slight advantage."
         elif abs(score) < 3:
-            return f"{'White' if score > 0 else 'Black'} has a clear advantage."
+            return base_comment + f"{'White' if score > 0 else 'Black'} has a clear advantage."
         else:
-            return f"{'White' if score > 0 else 'Black'} has a winning position."
+            return base_comment + f"{'White' if score > 0 else 'Black'} has a winning position."
             
     def analyze_position(self, fen: str, depth: int = 20) -> AnalysisResponse:
         if not self.process or self.process.poll() is not None:
